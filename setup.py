@@ -1824,6 +1824,7 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
+                "gfx1032": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
                 "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
 # The TheRock nightly indexes are pruned and move on, and each GPU family's index holds its own range (#1103: gfx103X-all
@@ -1841,7 +1842,7 @@ ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the whe
 # STRATA_EXPERIMENTAL_GFX1103=1 (opt-in, unsupported): the Radeon 780M / 760M / 740M iGPU (Ryzen 7040 / 8040, gfx1103) is taken
 # as a unified-memory AMD card like Strix Halo, with the portable kernels (no WMMA) (measured on one machine: Ryzen 7 255).  Unset: unchanged.
 GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") + (("gfx1103",) if GFX1103_OPT_IN else ())
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1151") + (("gfx1103",) if GFX1103_OPT_IN else ())
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
              "gfx1102": "AMD Radeon RX 7600 / 7600 XT (gfx1102)",
@@ -1849,11 +1850,17 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
              "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
+             "gfx1032": "AMD Radeon RX 6600 / 6600 XT series (gfx1032)",
              "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
              "gfx1152": "AMD Radeon 860M / 840M (Ryzen AI 300, Krackan Point, gfx1152)",
              "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)"}
+
+# KFD gfx_target_version can report gfx1032 for some RDNA2 cards (e.g. RX 6600 XT 16 GB),
+# but ROCm/HIP reports the runtime gcnArchName as gfx1030.  Normalize so setup compiles for
+# what the runtime actually reports, and the engine accepts both as compatible RDNA2.
+KFD_RUNTIME_ARCH = {}  # kept empty: ROCm 7.13+ runtime requires exact arch match in the fatbin
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
              "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
@@ -2108,6 +2115,7 @@ def amd_gpus(sysfs="/sys"):
         except (OSError, ValueError):
             continue
         arch = f"gfx{ver // 10000}{(ver // 100) % 100:x}{ver % 100:x}"
+        arch = KFD_RUNTIME_ARCH.get(arch, arch)
         dev = Path(sysfs) / f"class/drm/renderD{props.get('drm_render_minor', '')}/device"
         try:
             vram = int((dev / "mem_info_vram_total").read_text()) / 2 ** 30
@@ -2537,6 +2545,15 @@ def rocm_dev_missing(sysroot: Path) -> list:
     lang = "cmake/hip-lang/hip-lang-config.cmake"     # where CMake's HIP support looks for it
     need = {"lib/" + lang: [sysroot / d / lang for d in ("lib", "lib64", "lib/x86_64-unknown-linux-gnu")],
             "include/hip/hip_runtime.h": [sysroot / "include" / "hip" / "hip_runtime.h"]}
+    # Fedora ROCm packages install to /usr, not under sysroot
+    if sysroot == Path("/usr"):
+        need["lib/" + lang] += [sysroot / d / lang for d in ("usr/lib", "usr/lib64")]
+        need["include/hip/hip_runtime.h"] += [sysroot / "usr" / "include" / "hip" / "hip_runtime.h"]
+    # hipblas cmake config: conda SDK has it, most system ROCm (incl. Fedora) lack it
+    # Without it cmake's find_package(hipblas CONFIG REQUIRED) fails
+    if sysroot == Path("/usr"):
+        need["lib/hipblas-config.cmake"] = [sysroot / "usr" / "lib64" / "cmake" / "hipblas" / "hipblas-config.cmake",
+                                            sysroot / "usr" / "lib" / "cmake" / "hipblas" / "hipblas-config.cmake"]
     return [name for name, paths in need.items() if not any(p.is_file() for p in paths)]
 
 
@@ -2557,6 +2574,14 @@ def rocm_root(archs):
         else:                                          # #446: a runtime-only ROCm (no -dev packages): cmake would fail
             warn(f"the ROCm in {sysroot} has no HIP development files ({', '.join(missing)}): using AMD's wheels in "
                  ".venv instead (or install them, e.g. AMD's amdrocm-core-dev package for your ROCm and card)")
+    # Fedora and other distros install ROCm to /usr, not /opt/rocm
+    if not os.environ.get("ROCM_PATH"):
+        alt = Path("/usr")
+        if (alt / "bin" / "hipcc").exists() and list((alt / "lib64").glob("libhipblas.so*")):
+            ver = rocm_version(alt)
+            missing = rocm_dev_missing(alt)
+            if (ver is None or ver >= ROCM_SYSTEM_MIN) and not missing:
+                return alt, [str(alt / "lib64"), str(alt / "lib")]
     indexes = list(dict.fromkeys(rocm_index(a) for a in archs))
     if len(indexes) > 1:                               # TheRock's wheels hold one GPU family's libraries
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "

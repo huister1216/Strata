@@ -49,7 +49,7 @@ __device__ __forceinline__ uint16_t hf_sat(float f) { return hf(isnan(f) ? f : f
 // The prompt path's 16-bit activation image for the BF16-weight GEMMs: BF16, or FP16 where the GEMM library is fast
 // only in FP16 (prompt_f16() in gemm.cu: rocBLAS on gfx103x).  Set once per device before the first prompt.
 #if defined(__HIPCC__)   // HIP only (#835): the CUDA kernels stay exactly as they were, they never read the flag
-__device__ int g_act_f16 = 0;
+__managed__ int g_act_f16 = 0;
 __device__ __forceinline__ uint16_t act16(float f) { return g_act_f16 ? hf_sat(f) : bf(f); }
 #else
 __device__ __forceinline__ uint16_t act16(float f) { return bf(f); }
@@ -1809,11 +1809,7 @@ void set_act_f16(bool on) {
     (void) on;   // CUDA: the activation image is always BF16
     return;
 #else
-    const int v = on ? 1 : 0;
-    if (cudaMemcpyToSymbol(g_act_f16, &v, sizeof v) != cudaSuccess) {
-        std::fprintf(stderr, "prefill: setting the FP16 activation image failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-        std::exit(1);
-    }
+    g_act_f16 = on ? 1 : 0;
 #endif
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {

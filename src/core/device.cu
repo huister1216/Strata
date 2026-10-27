@@ -33,11 +33,16 @@ std::string base_arch(const char* gcn_arch_name) {
     std::string arch(gcn_arch_name);
     const size_t colon = arch.find(':');
     if (colon != std::string::npos) arch.resize(colon);
+    if (arch == "gfx1032") arch = "gfx1030";   // KFD topology ID for some RDNA2 cards
     return arch;
 }
 
 bool compiled_for(const std::string& arch) {
     const std::string list = STRATA_HIP_ARCHS;
+    // gfx1030 and gfx1032 are the same RDNA2 family; accept either when the binary targets one.
+    if (arch == "gfx1030" || arch == "gfx1032") {
+        if (list.find("gfx1030") != std::string::npos || list.find("gfx1032") != std::string::npos) return true;
+    }
     size_t a = 0;
     while (a <= list.size()) {
         size_t b = list.find(',', a);
