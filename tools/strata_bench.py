@@ -728,9 +728,12 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     # from `rocm-smi --showdriverversion` belongs to the card in use too. The old "used empty" fallback stopped
     # firing once the marketing name arrived, and the run recorded "GPU driver: not read".
     driver = next((g.get("driver") for g in used if g.get("driver")), None) or local.get("rocm_driver")
+    # per-card extra fields (power, PCIe, temperature) only NVIDIA fills; an AMD entry strips to {} and an
+    # empty stub in the record is noise, not detail
+    details = [d for d in ({k: v for k, v in g.items() if k not in ("name", "vram_mib", "driver")} for g in used) if d] or None
     return {
-        "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
-        "gpu_detail": [{k: v for k, v in g.items() if k not in ("name", "vram_mib", "driver")} for g in used] or None,
+        "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": driver,
+        "gpu_detail": details,
         "cuda": local.get("cuda"), "engine_build": engine_build(cfg),
         "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "storage": storage_info(),
@@ -916,8 +919,9 @@ def render_readme(res: dict) -> str:
          f"correctness check was run.", "",
          "## Hardware and software", "",
          f"- GPU and VRAM: {gpu}, {vram}",
-         f"- CPU: {mc.get('cpu') or 'not read'} ({mc.get('cpu_cores') or '?'} cores, {mc.get('cpu_threads') or '?'} threads); "
-         f"installed RAM: {mc.get('ram_gib') or '?'} GiB; storage: {mc.get('storage') or 'not read'}",
+         f"- CPU: {mc.get('cpu') or 'not read'} ({mc.get('cpu_cores') or '?'} cores, {mc.get('cpu_threads') or '?'} threads); ",
+         f"- Installed RAM: {mc.get('ram_gib') or '?'} GiB; ",
+         f"- Storage: {mc.get('storage') or 'not read'}; ",
          f"- OS: {mc.get('os')}; GPU driver: {mc.get('gpu_driver') or 'not read'}; "
          f"CUDA (driver supports up to): {mc.get('cuda') or 'not read'}"
          + (f"; engine built for CUDA {(mc.get('engine_build') or {}).get('cuda')}" if (mc.get('engine_build') or {}).get('cuda') else ""),
@@ -926,7 +930,7 @@ def render_readme(res: dict) -> str:
     for g in (mc.get("gpu_detail") or []):
         if g:
             L.append("- GPU detail (after the run, near idle): " + ", ".join(f"{k}={v}" for k, v in g.items() if v is not None))
-    L += ["- Background workloads: not recorded (GPU power limit/draw read above)", "",
+    L += [f"- Background workloads: not recorded{' (GPU power limit/draw read above)' if any(mc.get('gpu_detail') or []) else ''}", "",
          "## Model and configuration", "",
          f"- Model and quantization: {model}",
          f"- Context: {mc.get('context') or 'not read'} tokens; parallel slots: {mc.get('parallel_slots') or 1}",
