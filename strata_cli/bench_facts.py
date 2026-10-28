@@ -172,15 +172,79 @@ def nvidia_gpus() -> tuple[list[dict], str | None, str | None]:
     return cards, (cards[0]["driver"] if cards else None), cuda
 
 
+JUNK_CARD_NAME = re.compile(r"(?i)^\s*(?:n/?a|unknown(?:\s+device)?|none|null|0x[0-9a-f]+)\s*$")
+
+
+def _card_name(text):
+    """`text` when it actually names a card, else None: rocm-smi prints "Card Series: N/A" for a card its own
+    table has no marketing name for, "Card Model: 0x73ff" (the bare PCI device id) in that case, and neither names
+    the card."""
+    text = (text or "").strip()
+    return text if text and not JUNK_CARD_NAME.match(text) else None
+
+
+def rocminfo_marketing_names(out: str | None = None) -> list[str]:
+    """The marketing name rocminfo prints for every GPU agent (the VBIOS name through the driver); CPU agents
+    print one too, so only agents whose Name is gfx<arch> count. An empty Marketing Name is not a name."""
+    out = run_cmd(["rocminfo"]) if out is None else out
+    names, gpu_agent = [], False
+    for line in out.splitlines():
+        match = re.match(r"\s*Name:\s+(.*)", line)
+        if match:
+            gpu_agent = bool(re.match(r"gfx[0-9a-fA-F]+", match.group(1).strip()))
+            continue
+        match = re.match(r"\s*Marketing Name:\s*(.*)", line)
+        if match and gpu_agent:
+            names.append(_card_name(match.group(1)))
+            gpu_agent = False
+    return [n for n in names if n]
+
+
+SOFTWARE_GL = re.compile(r"(?i)llvmpipe|softpipe|swrast|lavapipe|virgl|swiftshader|basic render")
+
+
+def glxinfo_renderer_name() -> str | None:
+    """The card Mesa names over GLX: glxinfo's extended renderer info `Device:` line ("AMD Radeon RX 6600 XT
+    (radeonsi, dimgrey_cavefish, LLVM 22.1.9, DRM 3.65, 7.2.11)"), or the classic `OpenGL renderer string:`.
+    The parenthesised driver part is cut; software renderers name the host, not a card, so they are refused.
+    Needs a display connection: headless Linux prints nothing, which is the answer there."""
+    out = run_cmd(["glxinfo"])
+    name = None
+    for line in out.splitlines():
+        match = re.match(r"\s*Device:\s*(.+)", line)
+        if match:
+            name = match.group(1)
+            break
+        match = re.match(r"\s*OpenGL renderer string:\s*(.+)", line)
+        if match:
+            name = match.group(1)
+    name = (name or "").split("(")[0].strip()
+    return _card_name(name) if name and not SOFTWARE_GL.search(name) else None
+
+
+def amd_card_names(rocm_out: str | None = None) -> list[str]:
+    """The AMD cards of this PC, in ROCm order. rocm-smi first; ROCm 7 has marketing names only for cards in its
+    own table and prints "Card Series: N/A" / "Card Model: 0x73ff" (a bare PCI device id) for the rest, so fall
+    back to rocminfo's marketing name from the VBIOS, then to the name Mesa gives over GLX (glxinfo)."""
+    rocm = run_cmd(["rocm-smi", "--showproductname"]) if rocm_out is None else rocm_out
+    names = [_card_name(n) for n in re.findall(r"Card [Ss]eries:\s*(.+)", rocm)]
+    if not any(names):
+        names = [_card_name(n) for n in re.findall(r"Card [Mm]odel:\s*(.+)", rocm)]
+    if not any(names):
+        names = rocminfo_marketing_names()
+    if not any(names):
+        names = [n for n in [glxinfo_renderer_name()] if n]
+    return [n for n in names if n]
+
+
 def other_gpus() -> tuple[list[dict], str | None]:
     """AMD (rocm-smi, or the Windows registry), Apple silicon: -> (cards, driver version)."""
     cards, driver = [], None
-    rocm = run_cmd(["rocm-smi", "--showproductname"])
-    names = re.findall(r"Card [Ss]eries:\s*(.+)", rocm) or re.findall(r"Card [Mm]odel:\s*(.+)", rocm)
+    names = amd_card_names()
     if names:
         match = re.search(r"Driver version:\s*(\S+)", run_cmd(["rocm-smi", "--showdriverversion"]))
         driver = match.group(1) if match else None
-        cards = [{"device_index": i, "name": n.strip(), "memory_bytes": None, "memory_kind": "dedicated",
+        cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated",
                   "power_limit_w": None} for i, n in enumerate(names)]
     elif os.name == "nt":
         try:
@@ -265,6 +329,19 @@ def gpu_selection(config: dict | None, argv: list[str] | None) -> list[int]:
     return chosen
 
 
+def names_agree(a: str, b: str) -> bool:
+    """Whether the two tools name the same card: rocm-smi/rocminfo give the full marketing name
+    ("AMD Radeon RX 6600 XT"), the server's sysfs fallback is the shorter family ("AMD Radeon"), and Mesa cuts
+    the family off the other end ("Radeon Graphics"). Either spelling's words starting the other's is agreement."""
+    x, y = (a or "").lower().split(), (b or "").lower().split()
+    return bool(x) and bool(y) and (x[:len(y)] == y or y[:len(x)] == x)
+
+
+def fuller_name(a: str, b: str) -> str:
+    """The spelling with the more words, which is the more exact card name."""
+    return b if len((b or "").split()) > len((a or "").split()) else a
+
+
 def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir: Path | None,
              declared_background: list[str]) -> tuple[dict, dict]:
     """-> (the report's `hardware`, the driver and runtime facts the `software` block uses)."""
@@ -274,14 +351,18 @@ def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir
     if selected:
         cards = [c for c in cards if c["device_index"] in selected] or cards
     elif len(cards) > 1 and served_gpu:
-        named = [c for c in cards if c["name"] == served_gpu]
+        named = [c for c in cards if names_agree(c["name"], served_gpu)]
         cards = named[:1] or cards[:1]
     served = [n for n in (served_gpu or "").split(" + ") if n and n != "?"]
-    if served and cards and not all(n in {c["name"] for c in cards} for n in served):
+    if served and cards and not all(any(names_agree(n, c["name"]) for c in cards) for n in served):
         # the server reads cards the local tools do not list (another vendor's, or a different numbering)
         cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated", "power_limit_w": None}
                  for i, n in enumerate(served)]
         driver = cuda = None
+    elif served and cards:
+        for i, n in enumerate(served):      # the same card, two spellings: keep the fuller one (the server's
+            if i < len(cards):              # sysfs fallback can be shorter than the marketing name)
+                cards[i]["name"] = fuller_name(cards[i]["name"], n)
     if not cards and served:
         cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated", "power_limit_w": None}
                  for i, n in enumerate(served)]

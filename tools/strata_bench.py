@@ -495,9 +495,11 @@ def gpu_info_local() -> dict:
     if m:
         info["cuda"] = m.group(1)
     if not gpus:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from strata_cli.bench_facts import amd_card_names
         rocm = run_cmd(["rocm-smi", "--showproductname"])
-        names = re.findall(r"Card [Ss]eries:\s*(.+)", rocm) or re.findall(r"Card [Mm]odel:\s*(.+)", rocm)
-        info["gpus"] = [{"name": n.strip(), "vram_mib": None, "driver": None} for n in names]
+        info["gpus"] = [{"name": n, "vram_mib": None, "driver": None} for n in amd_card_names(rocm)]
         v = run_cmd(["rocm-smi", "--showdriverversion"])
         m2 = re.search(r"Driver version:\s*(\S+)", v)
         if m2:
@@ -607,6 +609,10 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     eng = metrics.get("engine") or {}
     local = gpu_info_local()
     view = config_view(cfg) if cfg else {}
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from strata_cli.bench_facts import fuller_name, names_agree
+
     # #1985: only the GPUs the engine uses - the config's / --gpu selection; with none given the engine runs on one card
     # (the one the server reports), not on every card the PC has
     used = local["gpus"]
@@ -614,26 +620,36 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     if sel:
         used = [local["gpus"][i] for i in sel if 0 <= i < len(local["gpus"])] or used
     elif len(used) > 1 and static.get("gpu_name"):
-        named = [g for g in used if g["name"] == static["gpu_name"]]
+        named = [g for g in used if names_agree(g["name"], static["gpu_name"])]
         used = named[:1] or used[:1]
     gpu_names = [g["name"] for g in used] or ([static["gpu_name"]] if static.get("gpu_name") else [])
     m = status.get("machine") or {}
     vram_mib = (m.get("gpu") or {}).get("total_mib") or None
     # #2001: the server names the cards it reads (" + " between them).  A name nvidia-smi does not list means the
     # engine runs on another vendor's card (an Intel Arc beside a GeForce): the server's names are the right ones, and
-    # so is its VRAM total - the PC's NVIDIA cards were not used.
+    # so is its VRAM total - the PC's NVIDIA cards were not used.  Two spellings of one card agree when one's words
+    # start the other's ("AMD Radeon" from the server's sysfs fallback, "AMD Radeon RX 6600 XT" from rocminfo); the
+    # fuller spelling then wins instead of the server's generic family replacing a marketing name.
     served = [n for n in (static.get("gpu_name") or "").split(" + ") if n and n != "?"]
-    if served and not all(n in {g["name"] for g in local["gpus"]} for n in served):
+    if served and not all(any(names_agree(n, g["name"]) for g in local["gpus"]) for n in served):
         gpu_names, used = served, []
         local = {**local, "cuda": None}            # the PC's CUDA belongs to cards the engine did not use
-    elif used and used[0].get("vram_mib"):
-        vram_mib = sum(g.get("vram_mib") or 0 for g in used)
+    else:
+        for i, n in enumerate(served):
+            if i < len(gpu_names):
+                gpu_names[i] = fuller_name(gpu_names[i], n)
+        if used and used[0].get("vram_mib"):
+            vram_mib = sum(g.get("vram_mib") or 0 for g in used)
     n_ctx = None
     for d in models.get("data") or []:
         n_ctx = (d.get("meta") or {}).get("n_ctx") or n_ctx
     n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
+    # The driver of the card in use: NVIDIA and Windows entries carry it; an AMD entry never does, and the version
+    # from `rocm-smi --showdriverversion` belongs to the card in use too. The old "used empty" fallback stopped
+    # firing once the marketing name arrived, and the run recorded "GPU driver: not read".
+    driver = next((g.get("driver") for g in used if g.get("driver")), None) or local.get("rocm_driver")
     return {
-        "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
+        "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": driver,
         "cuda": local.get("cuda"), "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
         "os": f"{platform.system()} {platform.release()} ({platform.version()})" if os.name == "nt" else f"{platform.system()} {platform.release()}",

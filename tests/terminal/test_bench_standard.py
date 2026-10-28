@@ -1145,6 +1145,93 @@ class NvidiaBannerTests(unittest.TestCase):
             self.assertEqual((driver, cuda), ("615.71.09", version))
 
 
+class AmdCardNameTests(unittest.TestCase):
+    """ROCm 7's rocm-smi names only cards in its own table; a consumer card prints "Card Series: N/A" and
+    "Card Model: 0x73ff" (the PCI device id), so the run was labelled "AMD Radeon" and its folder "unknown"."""
+
+    ROCM_JUNK = ("GPU[0] : Card Series: N/A\nGPU[0] : Card Model: 0x73ff\n"
+                 "GPU[0] : Card Vendor: Advanced Micro Devices, Inc.\n")
+    ROCMINFO = ("Agent 1\n  Name: gfx1032\n  Marketing Name: AMD Radeon RX 6600 XT\n  Vendor Name: AMD\n"
+                "Agent 2\n  Name: AC_00\n  Marketing Name: 12th Gen Intel(R) Core(TM) i5-12400F\n")
+    GLXINFO = "    OpenGL renderer string: AMD Radeon RX 6600 XT (radeonsi, dimgrey_cavefish, LLVM 22.1.9)\n"
+
+    def fake(self, outputs):
+        return mock.patch.object(bench_facts, "run_cmd", side_effect=lambda cmd, timeout=15: outputs.get(cmd[0], ""))
+
+    def test_rocminfo_names_the_card_when_rocm_smi_prints_only_placeholders(self):
+        with self.fake({"rocm-smi": self.ROCM_JUNK, "rocminfo": self.ROCMINFO}):
+            cards, _driver = bench_facts.other_gpus()
+        self.assertEqual([c["name"] for c in cards], ["AMD Radeon RX 6600 XT"])  # never 0x73ff, never the CPU agent
+
+    def test_glxinfo_names_the_card_when_neither_rocm_tool_has_a_name(self):
+        with self.fake({"rocm-smi": self.ROCM_JUNK, "glxinfo": self.GLXINFO}):
+            cards, _driver = bench_facts.other_gpus()
+        self.assertEqual([c["name"] for c in cards], ["AMD Radeon RX 6600 XT"])
+
+    def test_a_software_renderer_never_names_the_card(self):
+        junk_info = "    OpenGL renderer string: llvmpipe (LLVM 22.1.9, 256 bits)\n"
+        with self.fake({"rocm-smi": self.ROCM_JUNK, "glxinfo": junk_info}):
+            cards, _driver = bench_facts.other_gpus()
+        self.assertEqual(cards, [])
+
+
+class CardNameMergeTests(unittest.TestCase):
+    """The server's sysfs fallback ("AMD Radeon") must not replace the marketing name a local tool knows, and the
+    report folder must be named after the card, not "unknown"."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.model = self.root / "Qwen3.8-Flash-Next-IQ3_S-00001-of-00001.gguf"
+        self.model.write_bytes(b"model bytes")
+        self.server = MockStrata(self.model)
+        self.server.gpu_name = "AMD Radeon"  # the server only knows the card's family (sysfs fallback)
+        self.addCleanup(self.server.close)
+
+    def run_standard(self, cards):
+        with contextlib.ExitStack() as stack:
+            for name, value in (("nvidia_gpus", ([], None, None)), ("other_gpus", (cards, "7.2.11")),
+                                ("cpu_name", lambda: "Mock CPU"), ("ram_bytes", lambda: 64 * 2 ** 30),
+                                ("storage_of", lambda p: [{"kind": "nvme", "model": "Mock SSD", "bus": "nvme"}]),
+                                ("git_commit", lambda folder=None: COMMIT)):
+                stack.enter_context(mock.patch.object(bench_facts, name,
+                                                      **({"return_value": value} if isinstance(value, tuple)
+                                                         else {"side_effect": value})))
+            return bs.run(bs.Target(self.server.url, None), None, out_root=self.root)
+
+    def test_the_full_local_name_survives_the_servers_short_one(self):
+        doc, out = self.run_standard([{"device_index": 0, "name": "AMD Radeon RX 6600 XT",
+                                       "memory_bytes": 8576442368, "memory_kind": "dedicated",
+                                       "power_limit_w": None}])
+        self.assertEqual(doc["hardware"]["gpus"][0]["name"], "AMD Radeon RX 6600 XT")
+        self.assertRegex(out.name, r"^\d{4}-\d\d-\d\d-standard-rx-6600-xt-[0-9a-f]{8}$")
+
+    def test_the_community_report_keeps_the_marketing_name_and_names_its_folder_after_it(self):
+        from tools import strata_bench as sb
+        metrics = {"hardware_static": {"gpu_name": "AMD Radeon"}, "engine": {"version": "0.1.51"}}
+        local = {"gpus": [{"name": "AMD Radeon RX 6600 XT", "vram_mib": None, "driver": None}],
+                 "rocm_driver": "7.2.11-200.fc44.x86_64"}
+        with mock.patch.object(sb, "gpu_info_local", return_value=local), \
+                mock.patch.object(sb, "try_json", side_effect=lambda base, path, key, *a:
+                                   metrics if path == "/metrics" else {}):
+            machine = sb.collect_machine("http://127.0.0.1:8080", "", None)
+        self.assertEqual(machine["gpu"], ["AMD Radeon RX 6600 XT"])
+        self.assertEqual(sb.gpu_slug(machine), "rx-6600-xt")
+        # the AMD entry carries no per-card driver; --showdriverversion's version still belongs in the report
+        self.assertEqual(machine["gpu_driver"], "7.2.11-200.fc44.x86_64")
+
+    def test_a_card_only_the_server_reads_still_wins(self):  # #2001, unchanged
+        from tools import strata_bench as sb
+        metrics = {"hardware_static": {"gpu_name": "Intel Arc B580"}, "engine": {"version": "0.1.51"}}
+        local = {"gpus": [{"name": "NVIDIA GeForce RTX 3060", "vram_mib": 12288, "driver": "560.1"}], "cuda": "13.0"}
+        with mock.patch.object(sb, "gpu_info_local", return_value=local), \
+                mock.patch.object(sb, "try_json", side_effect=lambda base, path, key, *a:
+                                   metrics if path == "/metrics" else {}):
+            machine = sb.collect_machine("http://127.0.0.1:8080", "", None)
+        self.assertEqual(machine["gpu"], ["Intel Arc B580"])
+
+
 class ArchiveCommitTests(unittest.TestCase):
     """The release archive carried no COMMIT file, so every run on it was nonconforming."""
 
