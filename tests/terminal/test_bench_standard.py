@@ -1220,6 +1220,8 @@ class CardNameMergeTests(unittest.TestCase):
         self.assertEqual(sb.gpu_slug(machine), "rx-6600-xt")
         # the AMD entry carries no per-card driver; --showdriverversion's version still belongs in the report
         self.assertEqual(machine["gpu_driver"], "7.2.11-200.fc44.x86_64")
+        # and it carries no per-card detail either: null, not one empty stub per card
+        self.assertIsNone(machine["gpu_detail"])
 
     def test_a_card_only_the_server_reads_still_wins(self):  # #2001, unchanged
         from tools import strata_bench as sb
