@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from strata_cli import bench_facts as bf
 from tools import strata_bench as sb
 
 ASIC = {"gpu_data": [{"gpu": 0, "asic": {"market_name": "AMD Radeon AI PRO R9700", "target_graphics_version": "gfx1201"}},
@@ -64,6 +65,15 @@ class AmdSmiProbe(unittest.TestCase):
         self.cmd_patch = mock.patch.object(sb, "run_cmd", run_cmd)
         self.cmd_patch.start()
         self.addCleanup(self.cmd_patch.stop)
+        # strata_cli.bench_facts runs its own commands, so a patched strata_bench alone still lets the real card of
+        # the machine answering rocm-smi / rocminfo hide the fixture cards
+        self.facts_cmd = mock.patch.object(bf, "run_cmd", run_cmd)
+        self.facts_cmd.start()
+        self.addCleanup(self.facts_cmd.stop)
+        # the runtime row reads files of the ROCm install, which no test machine can promise
+        self.rocm = mock.patch.object(sb, "rocm_runtime", lambda cfg=None: "10.1.0")
+        self.rocm.start()
+        self.addCleanup(self.rocm.stop)
 
     def test_the_probe_names_both_cards(self):
         info = sb.gpu_info_local()
@@ -83,7 +93,11 @@ class AmdSmiProbe(unittest.TestCase):
             m = sb.collect_machine("http://127.0.0.1:1", "", None)
         self.assertEqual(m["gpu"], ["AMD Radeon AI PRO R9700"])
         self.assertEqual(m["gpu_vram_mib"], 34208743424 >> 20)
-        self.assertEqual(m["gpu_driver"], None)
+        # one amdgpu driver serves the PC: the row carries the version the machine states, here from the other card,
+        # and not the kernel release that `amd-smi` prints in the same field
+        self.assertEqual(m["gpu_driver"], "6.16.4")
+        # the report names the ROCm runtime of the card, not the kernel the amdgpu driver is built into
+        self.assertEqual(m["rocm"], "10.1.0")
 
 
 if __name__ == "__main__":

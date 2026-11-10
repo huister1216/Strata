@@ -516,18 +516,20 @@ def gpu_info_local() -> dict:
     if not gpus:
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
-        from strata_cli.bench_facts import amd_card_names
+        from strata_cli.bench_facts import amd_card_names, kernel_driver_version
         rocm = run_cmd(["rocm-smi", "--showproductname"])
         info["gpus"] = [{"name": n, "vram_mib": None, "driver": None} for n in amd_card_names(rocm)]
-        v = run_cmd(["rocm-smi", "--showdriverversion"])
-        m2 = re.search(r"Driver version:\s*(\S+)", v)
-        if m2:
-            info["rocm_driver"] = m2.group(1)
+        m2 = re.search(r"Driver version:\s*(\S+)", run_cmd(["rocm-smi", "--showdriverversion"]))
+        d = kernel_driver_version(m2.group(1) if m2 else None)
+        if d:
+            info["rocm_driver"] = d
     if not info["gpus"] and os.name != "nt":
         # ROCm 7 and newer ship `amd-smi` and no `rocm-smi`, so a Radeon wrote the server's vendor stub ("AMD
         # Radeon", `...-community-unknown-...`) and `GPU driver: not read`. `static --asic` gives the marketing
-        # name, `static --driver` the kernel driver's version, the PCI address only comes from `amd-smi list` and
-        # the VRAM size is the amdgpu driver's sysfs file for that address (same probe as strata_cli/bench_facts.py).
+        # name, `static --driver` the kernel driver's version (a driver built into the kernel states none, so that
+        # field repeats the kernel's release - see kernel_driver_version), the PCI address only comes from
+        # `amd-smi list` and the VRAM size is the amdgpu driver's sysfs file for that address (same probe as
+        # strata_cli/bench_facts.py).
         def amd_json(args):
             try:
                 return json.loads(run_cmd(["amd-smi", "static"] + args + ["--json"]).strip() or "{}").get("gpu_data") or []
@@ -538,13 +540,19 @@ def gpu_info_local() -> dict:
         except ValueError:
             bdf = {}
         drv = {e.get("gpu"): ((e.get("driver") or {}).get("version") or "") for e in amd_json(["--driver"])}
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from strata_cli.bench_facts import kernel_driver_version, amd_power_limits, pcie_link
+        # what the card is limited to and what link it runs on: the community guide asks for both, and `static
+        # --limit` plus the driver's own PCI link status answer them. No power draw: the suite runs the card, so a
+        # value read after it would not be the run's.
+        watts = amd_power_limits()
         cards = []
         for e in amd_json(["--asic"]):
             name = ((e.get("asic") or {}).get("market_name") or "").strip()
             if not name:
                 continue
-            d = drv.get(e.get("gpu"), "")
-            d = d if d.upper() not in ("", "N/A") else None
+            d = kernel_driver_version(drv.get(e.get("gpu"), ""))
             if d:
                 info["rocm_driver"] = info.get("rocm_driver") or d
             vram = None
@@ -554,7 +562,12 @@ def gpu_info_local() -> dict:
                         vram = int((dev / "mem_info_vram_total").read_text(encoding="utf-8").strip()) >> 20
                 except (OSError, ValueError):
                     pass
-            cards.append({"name": name, "vram_mib": vram, "driver": d})
+            detail = {}
+            if watts.get(e.get("gpu")) is not None:
+                detail["power_limit_w"] = watts[e["gpu"]]
+            if (link := pcie_link(bdf.get(e.get("gpu")))):
+                detail["pcie"] = link
+            cards.append({"name": name, "vram_mib": vram, "driver": d, **detail})
         info["gpus"] = cards
     if not info["gpus"] and os.name == "nt":
         # #1587: Windows with only an AMD card has neither nvidia-smi nor rocm-smi; the display class in the registry
@@ -599,6 +612,24 @@ def engine_build(cfg: dict | None) -> dict | None:
     except (OSError, ValueError):
         return None
     return {k: b[k] for k in ("version", "source", "cuda", "rocm", "archs", "ptx", "portable") if b.get(k) is not None} or None
+
+
+def rocm_runtime(cfg: dict | None) -> str | None:
+    """The ROCm this run used. `rocm-smi --showdriverversion` used to state it with the driver; ROCm 7 has no
+    `rocm-smi`, so a report of a recent AMD box read nothing. The same reader as `strata bench run` answers
+    (strata_control/rocm.py, through strata_cli/bench_facts.py): the ROCm the engine in its own folder was built
+    against first, then this venv's wheels, then a system install, then `amd-smi -h`."""
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from strata_cli.bench_facts import rocm_version
+    except ImportError:                                   # noqa: BLE001 - a report without the runtime is a report
+        return None
+    exe = (cfg or {}).get("exe")
+    try:
+        return rocm_version(str(Path(exe).parent) if exe else None)
+    except Exception:                                     # noqa: BLE001 - same
+        return None
 
 
 QUANT = re.compile(r"(?i)(?:^|[-_.])((?:UD-)?(?:IQ\d_[A-Z]+|Q\d_[A-Z0-9_]+|Q\d_K(?:_[A-Z]+)?|IQ\d_?[A-Z]*|BF16|F16|Q\d))(?=[-_.]|$)")
@@ -739,10 +770,14 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     # per-card extra fields (power, PCIe, temperature) only NVIDIA fills; an AMD entry strips to {} and an
     # empty stub in the record is noise, not detail
     details = [d for d in ({k: v for k, v in g.items() if k not in ("name", "vram_mib", "driver")} for g in used) if d] or None
+    eb = engine_build(cfg)
+    # the GPU runtime of an AMD card: only asked when a Radeon is in play, so an NVIDIA run starts no ROCm probes
+    amd = bool((eb or {}).get("rocm")) or any(str(a).startswith("gfx") for a in ((eb or {}).get("archs") or [])) or \
+        any(re.search(r"AMD|Radeon", n or "", re.I) for n in gpu_names)
     return {
         "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": driver,
         "gpu_detail": details,
-        "cuda": local.get("cuda"), "engine_build": engine_build(cfg),
+        "cuda": local.get("cuda"), "rocm": rocm_runtime(cfg) if amd else None, "engine_build": eb,
         "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "storage": storage_info(),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
@@ -921,24 +956,44 @@ def render_readme(res: dict) -> str:
     gpu = " + ".join(mc.get("gpu") or []) or "CPU only"
     vram = f"{mc['gpu_vram_mib'] / 1024:.0f} GiB VRAM" if mc.get("gpu_vram_mib") else "VRAM not read"
     model = (model_label(mc) if mc.get("model") else mc.get("quant")) or "model not read"
+    eb = mc.get("engine_build") or {}
+    # the community guide asks for the GPU runtime (CUDA/ROCm) and for whether the engine is a release download or a
+    # source build; the build record beside the engine exe answers both, and its `source` says which.
+    built = {"local": "engine built here from source", "local-hip": "engine built here from source (HIP)"}.get(eb.get("source"))
+    if eb.get("archs"):
+        built = (built + " for " if built else "engine built for ") + ", ".join(eb["archs"])
     L = [f"# Community benchmark on {gpu}", "",
          f"Measured on {res['date']} with `tools/strata_bench.py` (suite {SCHEMA}, {p['runs']} runs per test, medians with ranges). "
          f"Speeds are the engine's own timings; first-token times are measured by the client over HTTP. Speed only: no "
          f"correctness check was run.", "",
          "## Hardware and software", "",
          f"- GPU and VRAM: {gpu}, {vram}",
-         f"- CPU: {mc.get('cpu') or 'not read'} ({mc.get('cpu_cores') or '?'} cores, {mc.get('cpu_threads') or '?'} threads); ",
-         f"- Installed RAM: {mc.get('ram_gib') or '?'} GiB; ",
-         f"- Storage: {mc.get('storage') or 'not read'}; ",
-         f"- OS: {mc.get('os')}; GPU driver: {mc.get('gpu_driver') or 'not read'}; "
-         f"CUDA (driver supports up to): {mc.get('cuda') or 'not read'}"
-         + (f"; engine built for CUDA {(mc.get('engine_build') or {}).get('cuda')}" if (mc.get('engine_build') or {}).get('cuda') else ""),
+         f"- CPU: {mc.get('cpu') or 'not read'} ({mc.get('cpu_cores') or '?'} cores, {mc.get('cpu_threads') or '?'} threads)",
+         f"- Installed RAM: {mc.get('ram_gib') or '?'} GiB",
+         f"- Storage: {mc.get('storage') or 'not read'}",
+         f"- OS: {mc.get('os')}",
+         f"- GPU driver: " + (mc.get('gpu_driver') or ("the kernel's amdgpu driver, which has no version of its own" if mc.get('rocm') else 'not read')) +";",
+         f"  - CUDA (driver supports up to): {mc.get('cuda') or 'not read'}"
+         + (f"; engine built for CUDA {eb['cuda']}" if eb.get("cuda") else ""),
+         f"  - ROCm runtime: {mc['rocm']}" if mc.get("rocm") else ""
+         + (f"; {built}" if built else ""),
          f"- Strata: project {mc.get('strata_version') or '?'}, commit {mc.get('strata_commit') or 'not a git checkout'}; "
-         f"engine {mc.get('engine_version') or 'not read'}"]
-    for g in (mc.get("gpu_detail") or []):
-        if g:
-            L.append("- GPU detail (after the run, near idle): " + ", ".join(f"{k}={v}" for k, v in g.items() if v is not None))
-    L += [f"- Background workloads: not recorded{' (GPU power limit/draw read above)' if any(mc.get('gpu_detail') or []) else ''}", "",
+         + f"engine {mc.get('engine_version') or 'not read'}"]
+    detail = [g for g in (mc.get("gpu_detail") or []) if g]
+    for g in detail:
+        L.append("- GPU detail (read after the run): " + ", ".join(f"{k}={v}" for k, v in g.items() if v is not None))
+    if detail:
+        seen = sorted({k for g in detail for k in g} - {"name", "vram_mib", "driver"})
+        notes = []
+        if "power_limit_w" in seen:
+            notes.append("The power limit is what the card is set to")
+        if "pcie" in seen:
+            notes.append("the PCIe link is the driver's own link status for the slot the card sits in")
+        if set(seen) & {"power_draw_w", "temp_c", "pstate"}:
+            notes.append("a power draw, temperature or performance state was read after the run, near idle, not during it")
+        L.append("- What those lines read: " + ", ".join(seen) + (". " + "; ".join(notes) if notes else "")
+                 + ". None of it is the run's own utilisation.")
+    L += ["- Background workloads: not recorded", "",
          "## Model and configuration", "",
          f"- Model and quantization: {model}",
          f"- Context: {mc.get('context') or 'not read'} tokens; parallel slots: {mc.get('parallel_slots') or 1}",
@@ -987,7 +1042,7 @@ def render_readme(res: dict) -> str:
     L += ["", "Per-request data: `results.json`. Engine log lines from the start: `engine-log-excerpt.txt` (when this run started the server).", "",
           "## Correctness and limitations", "",
           "Not measured: this is a speed suite. The conversation uses the model's own replies, so token counts differ a little between runs. "
-          "Machine details come from the server, `nvidia-smi`/`rocm-smi` and the OS; background load is not recorded. "
+          "Machine details come from the server, `nvidia-smi`/`amd-smi` and the OS; background load is not recorded. "
           f"Total time of the suite: {res['elapsed_s']:.0f} s.", ""]
     return "\n".join(L)
 

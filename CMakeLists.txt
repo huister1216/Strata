@@ -315,6 +315,17 @@ target_compile_options(strata_warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>
   $<$<COMPILE_LANGUAGE:HIP>:-Wall>
   $<$<COMPILE_LANGUAGE:HIP>:-Wextra>)
+if(STRATA_ENABLE_HIP)
+  # ROCm's headers mark hipError_t nodiscard; CUDA's do not mark cudaError_t. The CUDA-shaped sources stay CUDA-shaped:
+  # ignoring the return in cleanup and error-sticky paths (a destructor must not throw; a failed call leaves the device
+  # error latched and the next checked call reports it) is the same code CUDA compiles warning-free, and on the HIP side
+  # the diagnostic comes from both the device pass and the host pass of every .cu, plus the host .cpp files that force-
+  # include the shim. Checked paths keep their own error checks, so this silences the mismatch, not a bug.
+  target_compile_options(strata_warnings INTERFACE
+    $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-result>
+    $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-value>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-Wno-unused-result>)
+endif()
 if(STRATA_WERROR)
   target_compile_options(strata_warnings INTERFACE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
@@ -559,6 +570,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_ENABLE_HIP)
+    # native_mmvq.cu and iq_kernels.cu are transcriptions of ggml's mmvq/vecdotq/dequantize/quantize (their headers say
+    # so). The third-party rule (strata_warnings reaches Strata's own targets only) extends to them: the HIP build runs
+    # every .cu through clang's host pass as well as the gfx pass, and clang's sign-compare and unused checks fire on
+    # the upstream shape in numbers a Strata diff could never carry without diverging from llama.cpp; nvcc's host pass
+    # (gcc) never showed them. The flags stay out of the CUDA build, so that path is byte-identical.
+    set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/iq_kernels.cu
+      PROPERTIES COMPILE_OPTIONS
+      "$<$<COMPILE_LANGUAGE:HIP>:-Wno-sign-compare>;$<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-function>;$<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-parameter>")
+  endif()
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)
@@ -2655,6 +2676,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_tq_overlay_dir} ${_strata_tq_overlay_dir}/include)
     endif()
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    # this branch does not link strata_warnings, so the same nodiscard pair as above: the Strata-shaped sources in
+    # this target (moe_fused*.cu, moe_f16_kq.cu) take the HIP compat headers and ignore hipError_t the way the CUDA
+    # build ignores cudaError_t. The ggml MMQ template instances do not take the compat headers and emit none of this.
+    target_compile_options(strata_mmq PRIVATE
+      $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-result>
+      $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-value>)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()

@@ -129,7 +129,10 @@ Home folders, user and host names, local network addresses and API keys are repl
 written. Read the report once before you share it: the benchmark cannot know what else you consider private.
 
 To share it, open a pull request that adds the folder (see [Submit a report](#submit-a-report)), or paste
-`README.md` into a GitHub issue. Add what the tool does not know: background load, power limits, storage.
+`README.md` into a GitHub issue. Add what the tool cannot know: what else was running on the machine, and the
+revision of a quantization repository. It reads the power limit and the PCIe link where the driver states them
+(`nvidia-smi` on NVIDIA; `amd-smi static --limit` and the kernel's own link status on AMD), and the storage list
+from the OS.
 
 To compare with an earlier run on the same machine (before and after an update or a setting change):
 

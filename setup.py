@@ -70,6 +70,7 @@ from strata_control import atomic
 from strata_control import draft_layer
 from strata_control import dsv41_context
 from strata_control import engine_component
+from strata_control import rocm
 from strata_control import sysinfo
 from strata_control.discovery import in_trash
 from strata_control import user_args
@@ -5101,12 +5102,15 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
 
 
 def rocm_version(root):
-    """(major, minor) of a ROCm install, from rocm-core's header; None when it has none."""
-    try:
-        text = (Path(root) / "include" / "rocm-core" / "rocm_version.h").read_text(encoding="utf-8")
-        return tuple(int(re.search(rf"#define\s+ROCM_VERSION_{k}\s+(\d+)", text).group(1)) for k in ("MAJOR", "MINOR"))
-    except (OSError, AttributeError, ValueError):
+    """(major, minor) of a ROCm install, as its own files state it; None when they state none. The reading itself is in
+    strata_control/rocm.py, so the installer, the Terminal and a benchmark report ask the same question the same way.
+    Only rocm-core's header was read here before, which a distribution's own pack (/usr on Fedora) does not carry: it
+    names its version only in the librocm-core soname, and that ROCm looked like an install of no version."""
+    text = rocm.version_text(root)
+    if not text:
         return None
+    parts = [int(p) for p in text.split(".")]
+    return (parts[0], parts[1] if len(parts) > 1 else 0)
 
 
 def rocm_dev_missing(sysroot: Path) -> list:
@@ -5278,8 +5282,10 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
              f"{binary_engine_version(ROOT / 'build-hip' / EXE)}, this source is {source_version()}): "
              "the installed engine is left as it was", "delete the folder build-hip and run this again")
     shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
+    rver = rocm.version_text(root)              # what a report of a run on this engine names as its GPU runtime
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
-            "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {})}
+            "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {}),
+            **({"rocm": rver} if rver else {})}
     if vision != "none":
         return build_vision_hip(eng, stamp, meta, llama, vsrc, archs, vision)
     stamp.write_text(json.dumps(meta, indent=1))

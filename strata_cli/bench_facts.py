@@ -12,7 +12,7 @@ import hashlib
 import json
 import os
 import platform
-from strata_control import sysinfo
+from strata_control import rocm, sysinfo
 import re
 import socket
 import subprocess
@@ -290,13 +290,64 @@ def amd_card_names(rocm_out: str | None = None) -> list[str]:
     return [n for n in names if n]
 
 
+def kernel_driver_version(stated: str | None) -> str | None:
+    """The amdgpu driver version as a tool states it, or None when it states none. A driver built into the kernel has
+    no version of its own: `amd-smi static --driver` repeats the kernel's release there (seen on Fedora, where the
+    field and `uname -r` are both `7.2.14-200.fc44.x86_64`), and ROCm 10 writes `N/A`. Neither belongs in a report's
+    driver row, which would read as if the card had a separate driver of that version."""
+    text = (stated or "").strip()
+    if not text or text.upper() == "N/A" or text == platform.release():
+        return None
+    return text
+
+
+def amd_power_limits() -> dict:
+    """The power limit of each AMD card, as watts keyed by the card's own index, from `amd-smi static --limit`:
+    `socket_power` is what the card is set to, `max_power` is the largest value that setting accepts, so the second
+    only answers when the first is missing (an older or restricted driver). ROCm 7's `rocm-smi` states the limit too,
+    and no answer at all marks the record's limit as unmeasured, which is not the same as a card with no limit."""
+    try:
+        rows = json.loads(run_cmd(["amd-smi", "static", "--limit", "--json"]).strip() or "{}").get("gpu_data") or []
+    except (ValueError, OSError):
+        return {}
+    limits = {}
+    for e in rows:
+        limit = e.get("limit") or {}
+        for key in ("socket_power", "max_power"):
+            try:
+                limits[int(e.get("gpu"))] = float(limit[key]["value"])
+                break
+            except (TypeError, ValueError, KeyError):
+                continue
+    return limits
+
+
+def pcie_link(bdf: str | None, devices_dir: str = "/sys/bus/pci/devices") -> str | None:
+    """The PCIe link a card runs on as the kernel states it, "gen4 x16". `amd-smi` has no PCIe field, so this reads
+    the link status the kernel keeps for the PCI address `amd-smi list` gives: the endpoint first, then the bridge of
+    the slot it is in, which is the side that knows when the card states only its own maximum."""
+    if not bdf:
+        return None
+    node = Path(devices_dir) / bdf
+    for dev in (node, node.resolve().parent):
+        try:
+            speed = (dev / "current_link_speed").read_text(encoding="utf-8").split()[0]
+            width = (dev / "current_link_width").read_text(encoding="utf-8").strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        gen = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}.get(speed)
+        if gen and width.isdigit():
+            return f"gen{gen} x{width}"
+    return None
+
+
 def other_gpus() -> tuple[list[dict], str | None]:
     """AMD (rocm-smi, or the Windows registry), Apple silicon: -> (cards, driver version)."""
     cards, driver = [], None
     names = amd_card_names()
     if names:
-        match = re.search(r"Driver version:\s*(\S+)", run_cmd(["rocm-smi", "--showdriverversion"]))
-        driver = match.group(1) if match else None
+        stated = re.search(r"Driver version:\s*(\S+)", run_cmd(["rocm-smi", "--showdriverversion"]))
+        driver = kernel_driver_version(stated.group(1) if stated else None)
         cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated",
                   "power_limit_w": None} for i, n in enumerate(names)]
     elif os.name == "nt":
@@ -329,7 +380,7 @@ def other_gpus() -> tuple[list[dict], str | None]:
             if not name:
                 continue
             d = drv.get(e.get("gpu"), "")
-            driver = driver or (d if d.upper() not in ("", "N/A") else None)
+            driver = driver or kernel_driver_version(d)
             vram = None
             for dev in glob.glob("/sys/class/drm/card[0-9]*/device"):
                 try:
@@ -346,24 +397,25 @@ def other_gpus() -> tuple[list[dict], str | None]:
         if chip:
             cards = [{"device_index": 0, "name": chip, "memory_bytes": ram_bytes(), "memory_kind": "shared",
                       "power_limit_w": None}]
+    if cards and os.name != "nt" and sys.platform != "darwin":
+        # the number belongs to the driver, not to a tool: whichever tool named the card, the limit comes from
+        # `amd-smi`, which is the one ROCm 7 and newer ship. A null here used to say "this card has no limit"
+        # when it only meant the probe never asked.
+        limits = amd_power_limits()
+        for c in cards:
+            c["power_limit_w"] = c["power_limit_w"] or limits.get(c["device_index"])
     return cards, driver
 
 
-def rocm_version() -> str | None:
-    """ROCm's own version, which `rocm-smi --showdriverversion` used to report with the driver. ROCm 10 has no
-    `rocm-smi` and no `/opt/rocm/.info/`: its version file sits under `<install>/core/.info/version`, and
-    `amd-smi -h` prints the same version."""
-    for base in [os.environ.get("ROCM_PATH", ""), "/opt/rocm"]:
-        if not base:
-            continue
-        for sub in (".info/version", "core/.info/version"):
-            try:
-                with open(os.path.join(base, sub), encoding="utf-8") as f:
-                    found = f.read().strip()
-                if found:
-                    return found
-            except OSError:
-                pass
+def rocm_version(engine_dir: str | None = None) -> str | None:
+    """ROCm's own version, which `rocm-smi --showdriverversion` used to report with the driver. ROCm 7 and newer have
+    no `rocm-smi`; the version comes from the ROCm itself (strata_control/rocm.py): the one the engine in `engine_dir`
+    was built against first, then the wheels in this venv, then `$ROCM_PATH` or a system install such as Fedora's
+    `/usr`. `amd-smi -h` prints the same version, which is the last thing to try. No engine folder means no engine to
+    ask, so only the last three sources answer; a caller that knows the engine names its folder."""
+    found = rocm.version(system_roots=[os.environ.get("ROCM_PATH") or "", *rocm.SYSTEM_ROOTS], engine_dir=engine_dir)
+    if found:
+        return found[0]
     match = re.search(r"ROCm version:\s*([\d.]+)", run_cmd(["amd-smi", "-h"]))
     return match.group(1) if match else None
 
@@ -446,7 +498,7 @@ def fuller_name(a: str, b: str) -> str:
 
 
 def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir: Path | None,
-             declared_background: list[str]) -> tuple[dict, dict]:
+             declared_background: list[str], engine_exe: str | None = None) -> tuple[dict, dict]:
     """-> (the report's `hardware`, the driver and runtime facts the `software` block uses)."""
     cards, driver, cuda = nvidia_gpus()
     if not cards:
@@ -498,9 +550,10 @@ def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir
         why.add(pointer("hardware", "background_workloads"),
                 "the runner does not inspect other programs; none were declared with --background")
     # an AMD card on Linux runs on ROCm, which the report names as the runtime; on ROCm 7 and newer that version no
-    # longer comes from rocm-smi, but from the install itself
-    rocm = rocm_version() if (sys.platform.startswith("linux") and cards and not cuda) else None
-    return block, {"driver": driver, "cuda": cuda, "rocm": rocm}
+    # longer comes from rocm-smi, but from the ROCm the engine runs on (its build, the wheels, or a system install)
+    runtime = rocm_version(str(Path(engine_exe).parent) if engine_exe else None) \
+        if (sys.platform.startswith("linux") and cards and not cuda) else None
+    return block, {"driver": driver, "cuda": cuda, "rocm": runtime}
 
 
 # ------------------------------------------------------------------------------------------------------------ software
@@ -566,7 +619,8 @@ def software(why: Why, machine: dict, *, engine_version: str | None, build_optio
              "build_kind": "source" if (ROOT / ".git").exists() else "release",
              "runner_commit": commit, "build_options": build_options}
     if not drivers:
-        why.add("/software/drivers", "no GPU driver version was reported by the local tools")
+        why.add("/software/drivers", "the local tools reported no GPU driver version; on Linux the amdgpu driver is "
+                                    "usually built into the kernel, which has no driver version of its own")
     if not runtime:
         why.add("/software/runtime", "no CUDA, ROCm or Metal runtime version was reported by the local tools")
     if commit is None:

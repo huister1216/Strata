@@ -208,13 +208,32 @@ class GpuLists(unittest.TestCase):
                         cfg.unlink()
                         (sysroot / "include/hip/hip_runtime.h").unlink()
 
+    def test_a_distro_rocm_names_its_version_in_the_library(self):
+        """A system ROCm that carries no `rocm_version.h` still states its version: Fedora's install in /usr keeps it in
+        the librocm-core soname. Reading only the header made such an install look version-less, and setup used it where
+        the version check should have passed it over for AMD's wheels."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertIsNone(setup.rocm_version(root))          # nothing there: still unknown, not (0, 0)
+            (root / "lib").mkdir()
+            (root / "lib" / "librocm-core.so.1.0.70101").write_text("")
+            self.assertEqual(setup.rocm_version(root), (7, 1))
+            (root / "lib" / "librocm-core.so.1.0.70101").unlink()
+            (root / "include/rocm-core").mkdir(parents=True)
+            (root / "include/rocm-core/rocm_version.h").write_text(
+                "#define ROCM_VERSION_MAJOR 7\n#define ROCM_VERSION_MINOR 14\n#define ROCM_VERSION_PATCH 0\n")
+            self.assertEqual(setup.rocm_version(root), (7, 14))
+
     def test_build_for_every_arch(self):
-        """build_engine_hip compiles for the set of the chosen cards' archs and records it in BUILD.json."""
+        """build_engine_hip compiles for the set of the chosen cards' archs and records it in BUILD.json, with the ROCm
+        it linked against: a report of a run on that engine names that runtime without asking the machine again."""
         calls = {}
         saved = {k: getattr(setup, k) for k in ("ROOT", "rocm_root", "cmake_build", "source_hash", "source_version",
                                                 "ok", "shutil")}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            (root / "lib").mkdir()                     # the ROCm the engine links against, named only in its library
+            (root / "lib" / "librocm-core.so.1.0.70101").write_text("")
 
             def fake_build(src, bdir, target, defs, vcvars, bat):
                 calls["defs"] = defs
@@ -232,8 +251,9 @@ class GpuLists(unittest.TestCase):
                 self.assertEqual(calls["archs"], ["gfx1100", "gfx1201"])
                 self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201", calls["defs"])
                 import json
-                self.assertEqual(json.loads((root / "engine" / "BUILD.json").read_text())["archs"],
-                                 ["gfx1100", "gfx1201"])
+                meta = json.loads((root / "engine" / "BUILD.json").read_text())
+                self.assertEqual(meta["archs"], ["gfx1100", "gfx1201"])
+                self.assertEqual(meta["rocm"], "7.1.1")          # the runtime a later report may name
                 calls.clear()                            # one of those cards alone: already built, no compile
                 setup.build_engine_hip({"arch": "gfx1100"}, root)
                 self.assertNotIn("defs", calls)
