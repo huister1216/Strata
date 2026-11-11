@@ -5,11 +5,14 @@ Measured on 2026-11-09 with `tools/strata_bench.py` (suite 1, 3 runs per test, m
 ## Hardware and software
 
 - GPU and VRAM: AMD Radeon RX 6600 XT, 8 GiB VRAM
-- CPU: 12th Gen Intel(R) Core(TM) i5-12400F (6 cores, 12 threads); 
-- Installed RAM: 62.6 GiB; 
-- Storage: sda     OCZ-VERTEX4            sata; sdb     ADATA SU635            sata; sdc     Storage Device         usb; sdd     Storage Device         usb; zram0; nvme1n1 WDC WDBA3V5000ANC-WRSN nvme; nvme0n1 Lexar SSD NM790 1TB    nvme; 
-- OS: Linux 7.2.14-200.fc44.x86_64; GPU driver: 7.2.14-200.fc44.x86_64; CUDA (driver supports up to): not read
-- Strata: project 0.1.58, commit 1de84607; engine 0.1.58
+- CPU: 12th Gen Intel(R) Core(TM) i5-12400F (6 cores, 12 threads)
+- Installed RAM: 62.6 GiB
+- Storage: sda     OCZ-VERTEX4            sata; sdb     ADATA SU635            sata; sdc     Storage Device         usb; sdd     Storage Device         usb; zram0; nvme1n1 WDC WDBA3V5000ANC-WRSN nvme; nvme0n1 Lexar SSD NM790 1TB    nvme
+- OS: Linux 7.2.14-200.fc44.x86_64; Fedora Linux 44 (KDE Plasma Desktop Edition)
+- GPU driver: the kernel's amdgpu driver, which has no version of its own
+  - CUDA (driver supports up to): not read
+  - ROCm runtime: 7.13.0
+- Strata: project 0.1.58, commit 181a69f9; engine 0.1.58
 - Background workloads: not recorded
 
 ## Model and configuration
@@ -35,28 +38,28 @@ Run by `python tools/strata_bench.py` against the HTTP API of a Strata server (s
 
 | Configuration | Actual prompt tokens | Reused tokens | Generated tokens | Runs | Prompt tok/s median and range | Decode tok/s median and range | TTFT seconds median and range |
 | --- | ---: | ---: | ---: | ---: | --- | --- | --- |
-| short chat | 46 (43-51) | 0 | 100 (100-100) | 9 | not measured | 22.3 (20.9-27.4) | 1.52 (1.37-1.64) |
-| 4K prompt, fresh | 4019 (4019-4019) | 0 (0-0) | 24 cap | 3 | 198.4 (197.2-199.0) | not measured | 20.32 (20.26-20.44) |
-| 16K prompt, fresh | 16058 (16058-16058) | 0 (0-0) | 24 cap | 3 | 198.0 (195.9-198.0) | not measured | 81.18 (81.17-82.02) |
-| agent session, follow-up turns | 13594 (13509-13605) at the last turn | see below | up to 64 | 3 | see below | 22.4 (20.5-24.7) | 24.38 (12.22-29.72) |
+| short chat | 46 (43-51) | 0 | 100 (100-100) | 9 | not measured | 21.5 (10.9-27.2) | 1.55 (1.38-2.57) |
+| 4K prompt, fresh | 4019 (4019-4019) | 0 (0-0) | 24 cap | 3 | 194.4 (159.9-195.9) | not measured | 20.73 (20.57-25.19) |
+| 16K prompt, fresh | 16058 (16058-16058) | 0 (0-0) | 24 cap | 3 | 196.5 (194.2-196.5) | not measured | 81.80 (81.78-82.76) |
+| agent session, follow-up turns | 13602 (13588-13603) at the last turn | see below | up to 64 | 3 | see below | 22.4 (7.6-26.1) | 24.46 (12.24-29.77) |
 
 Ranges are the lowest and highest of the runs; `Runs` counts requests that returned a token.
 
 ### Agent session (conversation cache)
 
-Cache hit over the follow-up turns: 69.9 % (69.7-69.9); earlier-turn tokens read again per session: 5 (5-5) (earlier turns that the cache did not hold; the 12726 (12724-12726) new tokens of the files are read once); first turn (nothing cached) first token: 7.14 s (7.06-8.45).
+Cache hit over the follow-up turns: 69.9 % (69.9-69.9); earlier-turn tokens read again per session: 5 (5-5) (earlier turns that the cache did not hold; the 12725 (12725-12726) new tokens of the files are read once); first turn (nothing cached) first token: 7.05 s (7.05-9.00).
 
 | Turn (run 1) | Prompt tokens | Reused | Read | Prompt tok/s | First token (s) | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 609 | 0 | 609 | 72.6 | 8.454 | 16.1 |
-| 1 | 3823 | 618 | 3205 | 111.7 | 28.75 | 21.0 |
-| 2 | 5356 | 3886 | 1470 | 105.6 | 13.982 | 21.5 |
-| 3 | 8577 | 5397 | 3180 | 107.3 | 29.716 | 23.1 |
-| 4 | 10767 | 8603 | 2164 | 106.9 | 20.308 | 23.7 |
-| 5 | 13509 | 10799 | 2710 | 106.6 | 25.475 | 22.2 |
+| 0 | 609 | 0 | 609 | 68.2 | 9.004 | 21.3 |
+| 1 | 3839 | 634 | 3205 | 111.5 | 28.811 | 23.6 |
+| 2 | 5372 | 3902 | 1470 | 105.8 | 13.956 | 20.6 |
+| 3 | 8616 | 5435 | 3181 | 107.1 | 29.774 | 20.2 |
+| 4 | 10839 | 8675 | 2164 | 106.7 | 20.35 | 26.1 |
+| 5 | 13588 | 10878 | 2710 | 106.1 | 25.61 | 24.6 |
 
 Per-request data: `results.json`. Engine log lines from the start: `engine-log-excerpt.txt` (when this run started the server).
 
 ## Correctness and limitations
 
-Not measured: this is a speed suite. The conversation uses the model's own replies, so token counts differ a little between runs. Machine details come from the server, `nvidia-smi`/`rocm-smi` and the OS; background load is not recorded. Total time of the suite: 786 s.
+Not measured: this is a speed suite. The conversation uses the model's own replies, so token counts differ a little between runs. Machine details come from the server, `nvidia-smi`/`amd-smi` and the OS; background load is not recorded. Total time of the suite: 824 s.
