@@ -108,5 +108,53 @@ class AddedCodeIsDisplayOnly(unittest.TestCase):
         self.assertIn("textContent", (WEB / "monitor.js").read_text(encoding="utf-8"))
 
 
+def pcie_block():
+    """The exact Monitor code that fills the PCIe card, kept in sync with app.js (no regex: the block starts at its
+    own line and ends at the next card's)."""
+    text = (WEB / "app.js").read_text(encoding="utf-8")
+    start = text.index("  const gen = hw.gpu_pcie_gen_max")
+    end = text.index('  setMetric("cpu"', start)
+    return text[start:end].rstrip()
+
+
+@unittest.skipUnless(NODE, "node is needed to run the page's own code")
+class PcieCard(unittest.TestCase):
+    """The card shows a live rate: NVML's traffic counter where the driver has one; where the amdgpu sysfs has
+    none (the RX 6600 XT's complaint - a static Gen4 x16), the server's expert-streaming rate instead."""
+
+    def card(self, hw, h=None):
+        script = ("const calls = [], sparks = [];"
+                  "const setMetric = (...a) => calls.push(a); const spark = (id, s) => sparks.push(s);"
+                  "const fmt = (n, d = 0) => Number(n).toFixed(d);\n"
+                  f"const hw = {json.dumps(hw)}; const h = {json.dumps(h or {})};\n"
+                  "function draw() {\n" + pcie_block() + "\n}\ndraw();\n"
+                  "console.log(JSON.stringify([calls, sparks]));")
+        out = run_node(script)
+        return out[0][0], out[1][0]
+
+    def test_nvml_counter_wins(self):
+        call, series = self.card({"gpu_pcie_gen_max": 4, "gpu_pcie_gen": 3, "gpu_pcie_width": 16,
+                                  "gpu_pcie_rx_mb": 219.0, "gpu_experts_mb": 12.0},
+                                 {"gpu_pcie_rx_mb": [5, 9], "gpu_experts_mb": [1, 2]})
+        self.assertEqual((call[1], call[2]), ("Gen4", "x16"))
+        self.assertIn("to GPU 219 MB/s", call[3])
+        self.assertIn("idle Gen3", call[3])
+        self.assertEqual(series, [5, 9])
+
+    def test_amd_falls_back_to_the_expert_rate(self):
+        call, series = self.card({"gpu_pcie_gen": 4, "gpu_pcie_width": 8, "gpu_pcie_rx_mb": None,
+                                  "gpu_experts_mb": 5.67},
+                                 {"gpu_pcie_rx_mb": [None, None], "gpu_experts_mb": [1.2, 5.67]})
+        self.assertEqual((call[1], call[2]), ("Gen4", "x8"))
+        self.assertIn("experts → GPU 5.7 MB/s", call[3])
+        self.assertEqual(series, [1.2, 5.67])
+
+    def test_no_counter_and_no_traffic_shows_no_rate(self):
+        call, series = self.card({"gpu_pcie_gen_max": 3, "gpu_pcie_width": 8, "gpu_pcie_rx_mb": None,
+                                  "gpu_experts_mb": None})
+        self.assertEqual(call[3], "")
+        self.assertIsNone(series)
+
+
 if __name__ == "__main__":
     unittest.main()

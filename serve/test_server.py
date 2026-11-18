@@ -5337,6 +5337,28 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
+    def test_full_name_where_the_driver_has_none(self):
+        """RDNA2 and older drivers write no `product_name`, or only the stub "AMD Radeon": the card then carries the
+        marketing name the ROCm/Mesa tools know (bench_facts' chain), at its own HIP index. Nothing naming it
+        either, and the driver's stub stays - the Monitor shows a name rather than a blank."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            (Path(d) / "class/drm/renderD129/device/product_name").unlink()                        # an RX 6600 XT
+            (Path(d) / "class/drm/renderD128/device/product_name").write_text("AMD Radeon\n")      # stub only
+            with mock.patch.object(telemetry, "SYSFS", d), \
+                 mock.patch("strata_cli.bench_facts.amd_card_names",
+                            lambda: ["AMD Radeon RX 6600 XT", "AMD Radeon RX 9070 XT"]):
+                self.assertEqual([r.name() for r in (telemetry.gpu_reader(0, amd=True),
+                                                     telemetry.gpu_reader(1, amd=True))],
+                                 ["AMD Radeon RX 6600 XT", "AMD Radeon RX 9070 XT"])
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            (Path(d) / "class/drm/renderD129/device/product_name").unlink()
+            with mock.patch.object(telemetry, "SYSFS", d), \
+                 mock.patch("strata_cli.bench_facts.amd_card_names", lambda: []):
+                self.assertEqual(telemetry.gpu_reader(0, amd=True).name(), "AMD Radeon")
+
     def test_free_vram_on_hip(self):
         from serve import telemetry
         tok = ByteTokenizer()

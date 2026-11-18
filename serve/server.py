@@ -4926,6 +4926,9 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
+        # (finished-at, expert blobs) per request: the Monitor's PCIe rate for cards whose driver has no traffic
+        # counter (the amdgpu sysfs has none, #301); window EXPERT_TRAFFIC_WINDOW_S
+        self.expert_traffic = collections.deque(maxlen=512)
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         # /metrics/prometheus' two throughput gauges need the totals as they stood at the last scrape, because
         # llama.cpp averages them over the window between two scrapes (#2341).
@@ -5653,7 +5656,8 @@ class Service:
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "gpu_experts_mb": self._experts_pcie_mb_s()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
@@ -5661,6 +5665,27 @@ class Service:
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+
+    EXPERT_TRAFFIC_WINDOW_S = 60.0        # the Monitor's HISTORY: 60 one-second samples
+
+    def _experts_pcie_mb_s(self):
+        """MB/s of expert blobs the GPU fetched over PCIe, averaged over the last minute.  The amdgpu driver has no
+        PCIe traffic counter (#301), so the Monitor's PCIe card falls back to the engine's own counts: the blobs
+        streamed for the prompt (`experts_streamed`) plus the ones --pcie-frac offloaded at decode (#588, on more
+        than one GPU some of those were computed by the other card, not fetched), priced by the engine's average
+        blob size (expert_cache_mib / expert_slots).  None when nothing ran in the window, or the engine gave no
+        counts, or no cache size to price them with."""
+        cut = time.time() - self.EXPERT_TRAFFIC_WINDOW_S
+        while self.expert_traffic and self.expert_traffic[0][0] < cut:
+            self.expert_traffic.popleft()
+        blobs = sum(n for _, n in list(self.expert_traffic))    # the sampler thread may add while we read
+        if not blobs:
+            return None
+        info = getattr(self.engine, "info", None) or {}
+        slots, mib = info.get("expert_slots") or 0, info.get("expert_cache_mib") or 0
+        if not slots or not mib:
+            return None
+        return round(blobs * mib / slots / self.EXPERT_TRAFFIC_WINDOW_S, 1)
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -6702,6 +6727,12 @@ class Service:
                                 t["decode_ms"] += last.get("decode_ms") or 0.0
                                 t["drafts_offered"] += last.get("drafts_offered") or 0
                                 t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                # the expert blobs this request's GPU fetched over PCIe (prompt streaming + the
+                                # --pcie-frac decode offload, #588), for the rate the PCIe card shows without a
+                                # driver counter; blobs only - bytes/expert comes from the engine's cache figures
+                                blobs = (last.get("experts_streamed") or 0) + (last.get("offloaded") or 0)
+                                if blobs:
+                                    self.expert_traffic.append((time.time(), blobs))
                                 ft0 = st.get("first_token")             # this request's own (#465: one per request)
                                 self.latencies.observe(ft0 - started if ft0 else None, n,
                                                        (last.get("decode_ms") or 0.0) / 1000, time.time() - started)

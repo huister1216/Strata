@@ -2,10 +2,11 @@
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
-  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.  On macOS (Metal backend): IOKit's
-  IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an Apple
-  Silicon GPU sits on the die, so there is no PCIe link.
+  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput. With the AMD backend (#301): the
+  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power; the sysfs has no PCIe traffic counter, so
+  while serving the server offers its own expert-streaming rate (gpu_experts_mb) for the PCIe card instead.  On
+  macOS (Metal backend): IOKit's IOAccelerator registry - load and VRAM; the temperature and power sensors need
+  root (`powermetrics`), and an Apple Silicon GPU sits on the die, so there is no PCIe link.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -140,11 +141,14 @@ def amd_device_dir(index, sysfs=None):
 class _Amd:
     """#301: an AMD card's readings from the amdgpu driver's sysfs files (Linux; no ROCm library needed), with _Nvml's
     interface: load (gpu_busy_percent), VRAM (mem_info_vram_used / _total), and from its hwmon folder the temperature
-    (temp1_input, the edge sensor, m°C), power (power1_average or power1_input, µW) and its cap (power1_cap)."""
+    (temp1_input, the edge sensor, m°C), power (power1_average or power1_input, µW) and its cap (power1_cap).  Its
+    name is the driver's `product_name`, falling back to what ROCm's and Mesa's tools know on drivers that have none."""
 
     def __init__(self, index=0, sysfs=None):
+        self.index = index
         self.dev = amd_device_dir(index, sysfs)
         self.hwmon = None
+        self._name = None
         if self.dev:
             try:
                 hw = sorted(os.listdir(os.path.join(self.dev, "hwmon")))
@@ -166,9 +170,23 @@ class _Amd:
     def name(self):
         try:
             with open(os.path.join(self.dev, "product_name"), encoding="utf-8") as f:
-                return f.read().strip() or "AMD Radeon"
+                name = f.read().strip()
         except (OSError, TypeError):
-            return "AMD Radeon"
+            name = ""
+        if name and name != "AMD Radeon":
+            return name
+        # RDNA2 and older drivers write no `product_name` (or only the bare stub), which left the Monitor calling
+        # an RX 6600 XT just "AMD Radeon". The card's own tools know its marketing name: rocminfo's VBIOS name, or
+        # Mesa's GLX renderer where the ROCm tools have none - bench_facts' chain, in ROCm order. Asked once per
+        # card; when nothing names the card either, the driver's stub stays.
+        if self._name is None:
+            try:
+                from strata_cli.bench_facts import amd_card_names
+                names = amd_card_names()
+                self._name = names[self.index] if 0 <= self.index < len(names) else ""
+            except Exception:                               # noqa: BLE001 - telemetry never breaks the server
+                self._name = ""
+        return self._name or name or "AMD Radeon"
 
     @staticmethod
     def _gen(text):
@@ -665,8 +683,8 @@ class Telemetry:
                 continue
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "gpu_experts_mb",
+                          "cpu", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)

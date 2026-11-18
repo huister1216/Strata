@@ -494,10 +494,15 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+  // the driver's own traffic counter when it has one (NVML); the amdgpu sysfs has none, so an AMD card's PCIe
+  // traffic comes from the engine's expert counts (streaming + --pcie-frac offload) instead
+  const rx = hw.gpu_pcie_rx_mb, experts = hw.gpu_experts_mb;
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
-  spark("sp-pcie", h.gpu_pcie_rx_mb);
+            rx != null ? `to GPU ${fmt(rx, rx < 10 ? 1 : 0)} MB/s` +
+            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : "")
+            : experts != null ? `experts → GPU ${fmt(experts, experts < 10 ? 1 : 0)} MB/s` : "");
+  // an AMD card records an all-null rx history, not a missing one: take the experts series when rx has no number
+  spark("sp-pcie", h.gpu_pcie_rx_mb && h.gpu_pcie_rx_mb.some((v) => v != null) ? h.gpu_pcie_rx_mb : h.gpu_experts_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
