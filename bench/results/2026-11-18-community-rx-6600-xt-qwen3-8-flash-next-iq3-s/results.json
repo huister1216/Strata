@@ -33,7 +33,7 @@
   "storage": "sda     OCZ-VERTEX4            sata; zram0; nvme0n1 WDC WDBA3V5000ANC-WRSN nvme; nvme1n1 Lexar SSD NM790 1TB    nvme",
   "cpu_threads": 12,
   "ram_gib": 62.6,
-  "os": "Linux 7.3.4-200.fc44.x86_64",
+  "os": "Fedora Linux 44 (KDE Plasma Desktop Edition), Linux kernel 7.3.4-200.fc44.x86_64",
   "python": "3.14.10",
   "strata_version": "0.1.61",
   "strata_commit": "2344a9d0",

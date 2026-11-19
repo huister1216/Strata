@@ -557,19 +557,26 @@ def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir
 
 
 # ------------------------------------------------------------------------------------------------------------ software
+def os_pretty_name() -> str | None:
+    """What the distribution calls itself on Linux ("Fedora Linux 44 (KDE Plasma Desktop Edition)"), from the
+    PRETTY_NAME of `/etc/os-release`, which every systemd distribution ships (Debian, Ubuntu, Fedora, openSUSE, Arch,
+    RHEL and their derivatives). None when the file is not there or names nothing: an old release, a container with no
+    os-release, or a non-Linux system."""
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"') or None
+    except OSError:
+        pass
+    return None
+
+
 def os_info() -> dict:
     if os.name == "nt":
         return {"name": "Windows", "version": sysinfo.version()}
     if sys.platform == "darwin":
         return {"name": "macOS", "version": platform.mac_ver()[0] or sysinfo.release()}
-    name = None
-    try:
-        for line in Path("/etc/os-release").read_text().splitlines():
-            if line.startswith("PRETTY_NAME="):
-                name = line.split("=", 1)[1].strip().strip('"')
-    except OSError:
-        pass
-    return {"name": name or sysinfo.system(), "version": sysinfo.release()}
+    return {"name": os_pretty_name() or sysinfo.system(), "version": sysinfo.release()}
 
 
 def git_commit(folder: Path = ROOT) -> str | None:

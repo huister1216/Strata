@@ -8,7 +8,7 @@ Measured on 2026-11-18 with `tools/strata_bench.py` (suite 1, 3 runs per test, m
 - CPU: 12th Gen Intel(R) Core(TM) i5-12400F (6 cores, 12 threads)
 - Installed RAM: 62.6 GiB
 - Storage: sda     OCZ-VERTEX4            sata; zram0; nvme0n1 WDC WDBA3V5000ANC-WRSN nvme; nvme1n1 Lexar SSD NM790 1TB    nvme
-- OS: Linux 7.3.4-200.fc44.x86_64
+- OS: Fedora Linux 44 (KDE Plasma Desktop Edition), Linux kernel 7.3.4-200.fc44.x86_64
 - GPU driver: the kernel's amdgpu driver, which has no version of its own;
   - CUDA (driver supports up to): not read
   - ROCm runtime: 7.13.0

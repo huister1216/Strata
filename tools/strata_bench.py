@@ -489,6 +489,23 @@ def cpu_name() -> str | None:
     return platform.processor() or None
 
 
+def os_line() -> str:
+    """The operating system as one line for the report.
+
+    Linux: the distribution's own name from `/etc/os-release` PRETTY_NAME, then the kernel - "Fedora Linux 44 (KDE
+    Plasma Desktop Edition), Linux kernel 7.3.4-200.fc44.x86_64". The bare `Linux <kernel release>` this tool used to
+    write named no distribution, and the distribution is what decides which ROCm, CUDA or driver package the run was
+    made with; the same PRETTY_NAME is what `strata bench run` records (strata_cli/bench_facts.os_pretty_name). With no
+    os-release file to read the line stays as it was."""
+    if os.name == "nt":
+        return f"{platform.system()} {'11' if int(platform.version().split('.')[-1] or 0) >= 22000 else platform.release()} ({platform.version()})"
+    if sys.platform.startswith("linux"):
+        from strata_cli.bench_facts import os_pretty_name
+        distro, kernel = os_pretty_name(), f"Linux kernel {platform.release()}"
+        return f"{distro}, {kernel}" if distro else f"Linux {platform.release()}"
+    return f"{platform.system()} {platform.release()}"
+
+
 def gpu_info_local() -> dict:
     out = run_cmd(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,power.limit,power.draw,pcie.link.gen.current,pcie.link.width.current,pstate,temperature.gpu",
                    "--format=csv,noheader,nounits"])
@@ -780,7 +797,7 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
         "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "storage": storage_info(),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
-        "os": f"{platform.system()} {'11' if int(platform.version().split('.')[-1] or 0) >= 22000 else platform.release()} ({platform.version()})" if os.name == "nt" else f"{platform.system()} {platform.release()}",
+        "os": os_line(),
         "python": platform.python_version(),
         "strata_version": project_version(), "strata_commit": git_commit(),
         "engine_version": (eng.get("version") or status.get("engine") or str(props.get("build_info", "")).replace("Strata ", "") or None),
