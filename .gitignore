@@ -42,8 +42,8 @@ td.log
 /run-*.bat
 /terminal/run-*.sh
 /run-*.sh
-/terminal/strata-*.json
-/strata-*.json
+/terminal/strata-*.json*
+/strata-*.json*
 /terminal/strata-*.log
 /strata-*.log
 /terminal/build-strata.bat
